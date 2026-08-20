@@ -258,6 +258,64 @@ def normalize_legifrance_result(item: dict) -> dict:
     }
 
 
+def fetch_full_text(token: str, text_id: str, debug_log: list | None = None) -> str | None:
+    """
+    Récupère le texte intégral d'un texte JORF via son identifiant, en
+    utilisant /consult/jorf avec l'id (et non une date — cet endpoint sert
+    bien à récupérer UN texte précis, comme indiqué dans la doc officielle).
+
+    Le nom exact du champ attendu dans le payload ("textId" vs "id") et la
+    structure de la réponse peuvent nécessiter un ajustement si le premier
+    essai échoue — active le mode debug pour voir la réponse brute.
+    """
+    if not text_id:
+        return None
+
+    url = f"{LEGIFRANCE_BASE_URL}/consult/jorf"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    payload = {"textId": text_id}
+
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    if debug_log is not None:
+        debug_log.append({
+            "endpoint": "/consult/jorf (texte intégral)",
+            "payload": payload,
+            "status": response.status_code,
+            "response": response.text[:3000],
+        })
+
+    if response.status_code != 200:
+        return None
+
+    data = response.json()
+
+    # Structure exacte incertaine tant qu'on n'a pas vu un vrai exemple —
+    # on tente plusieurs emplacements plausibles pour le texte intégral :
+    # un champ "text" direct au niveau racine, ou un contenu réparti dans
+    # une liste d'articles avec un champ "content"/"texte".
+    if isinstance(data.get("text"), str) and data["text"].strip():
+        return re.sub(r"<[^>]+>", " ", data["text"]).strip()
+
+    article = data.get("article") or {}
+    if isinstance(article.get("content"), str):
+        return re.sub(r"<[^>]+>", " ", article["content"]).strip()
+
+    articles = data.get("articles") or []
+    parts = []
+    for art in articles:
+        content = art.get("content") or art.get("texte") or art.get("texteHtml")
+        if isinstance(content, str):
+            parts.append(re.sub(r"<[^>]+>", " ", content).strip())
+    if parts:
+        return "\n\n".join(parts)
+
+    return None
+
+
 def matches_environnement(texte: dict) -> bool:
     """Filtre local : le texte est-il probablement lié à l'environnement/CEE ?"""
     contenu = " ".join([
@@ -479,6 +537,14 @@ def main():
         titre = texte.get("titre", "Sans titre")
         is_cee = is_cee_specific(texte)
 
+        # Tente de récupérer le texte intégral (plutôt que le simple extrait
+        # renvoyé par /search) via son identifiant JORFTEXT, si disponible.
+        text_id = texte.get("id")
+        if text_id:
+            full_text = fetch_full_text(token, text_id, debug_log=api_debug_log if debug_mode else None)
+            if full_text:
+                texte["contenu"] = full_text
+
         if has_anthropic_key:
             with st.spinner(f"Résumé en cours : {titre[:60]}..."):
                 try:
@@ -487,7 +553,7 @@ def main():
                     resume = f"⚠️ Erreur lors du résumé : {e}"
         else:
             # Pas de clé Anthropic : on affiche le contenu brut disponible
-            # (contenu complet, ou résumé fourni par l'API, ou titre à défaut).
+            # (texte intégral si récupéré, sinon extrait, sinon titre).
             resume = texte.get("contenu") or texte.get("resume") or "(Aucun contenu brut disponible dans la réponse API pour ce texte.)"
 
         resultats.append({
