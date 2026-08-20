@@ -231,21 +231,33 @@ def main():
     )
 
     # --- Vérification des secrets ---
-    missing = [
-        k for k in ["PISTE_CLIENT_ID", "PISTE_CLIENT_SECRET", "ANTHROPIC_API_KEY"]
+    # PISTE est obligatoire (sans ça, impossible de récupérer les textes).
+    # ANTHROPIC_API_KEY est optionnelle : si absente, l'app affiche les
+    # textes bruts sans résumé, ce qui permet de valider la récupération
+    # côté Légifrance avant d'activer la couche IA.
+    missing_required = [
+        k for k in ["PISTE_CLIENT_ID", "PISTE_CLIENT_SECRET"]
         if k not in st.secrets
     ]
-    if missing:
+    if missing_required:
         st.error(
-            "Secrets manquants : " + ", ".join(missing) +
+            "Secrets manquants : " + ", ".join(missing_required) +
             ".\n\nAjoute-les dans `.streamlit/secrets.toml` en local, ou dans "
             "les Secrets de ton app sur Streamlit Community Cloud."
         )
         st.code(
-            'PISTE_CLIENT_ID = "..."\nPISTE_CLIENT_SECRET = "..."\nANTHROPIC_API_KEY = "..."',
+            'PISTE_CLIENT_ID = "..."\nPISTE_CLIENT_SECRET = "..."\nANTHROPIC_API_KEY = "..."  # optionnel',
             language="toml",
         )
         st.stop()
+
+    has_anthropic_key = "ANTHROPIC_API_KEY" in st.secrets
+    if not has_anthropic_key:
+        st.warning(
+            "⚠️ Clé ANTHROPIC_API_KEY absente : les textes seront affichés "
+            "sans résumé automatique. Ajoute-la dans les Secrets pour activer "
+            "les résumés IA."
+        )
 
     # --- Barre latérale : paramètres ---
     with st.sidebar:
@@ -308,7 +320,7 @@ def main():
     st.success(f"{len(textes)} texte(s) trouvé(s).")
 
     # --- Résumé + affichage ---
-    anthropic_client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+    anthropic_client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"]) if has_anthropic_key else None
     resultats = []
 
     progress = st.progress(0.0)
@@ -316,11 +328,16 @@ def main():
         titre = texte.get("titre", "Sans titre")
         is_cee = is_cee_specific(texte)
 
-        with st.spinner(f"Résumé en cours : {titre[:60]}..."):
-            try:
-                resume = summarize_text(anthropic_client, texte, focus_cee=(cee_focus and is_cee))
-            except Exception as e:
-                resume = f"⚠️ Erreur lors du résumé : {e}"
+        if has_anthropic_key:
+            with st.spinner(f"Résumé en cours : {titre[:60]}..."):
+                try:
+                    resume = summarize_text(anthropic_client, texte, focus_cee=(cee_focus and is_cee))
+                except Exception as e:
+                    resume = f"⚠️ Erreur lors du résumé : {e}"
+        else:
+            # Pas de clé Anthropic : on affiche le contenu brut disponible
+            # (contenu complet, ou résumé fourni par l'API, ou titre à défaut).
+            resume = texte.get("contenu") or texte.get("resume") or "(Aucun contenu brut disponible dans la réponse API pour ce texte.)"
 
         resultats.append({"titre": titre, "nature": texte.get("nature", ""), "cee": is_cee, "resume": resume})
         progress.progress((i + 1) / len(textes))
@@ -332,8 +349,9 @@ def main():
 
     for r in resultats:
         badge = "🔋 CEE" if r["cee"] else "🌱 Environnement"
+        label = "Résumé IA" if has_anthropic_key else "Contenu brut (pas de résumé IA)"
         with st.container(border=True):
-            st.markdown(f"**{badge}** · *{r['nature']}*")
+            st.markdown(f"**{badge}** · *{r['nature']}* · _{label}_")
             st.subheader(r["titre"])
             st.markdown(r["resume"])
 
