@@ -87,7 +87,7 @@ def get_piste_token(client_id: str, client_secret: str) -> str:
 # Récupération des textes du JO
 # ---------------------------------------------------------------------------
 
-def fetch_jo_texts(token: str, target_date: str) -> list[dict]:
+def fetch_jo_texts(token: str, target_date: str, debug_log: list | None = None) -> list[dict]:
     """
     Récupère les textes publiés au JO à une date donnée (fonds JORF).
 
@@ -97,6 +97,9 @@ def fetch_jo_texts(token: str, target_date: str) -> list[dict]:
     Pour lister les textes d'un jour donné, il faut passer par
     /consult/jorfCont, qui renvoie le "conteneur" du Journal Officiel de
     ce jour avec la structure (sommaire) des textes qu'il contient.
+
+    debug_log : si fourni, on y ajoute la requête/réponse brute pour
+    diagnostic (utilisé par le mode debug de l'interface).
 
     NOTE : le nom exact des champs de payload/réponse peut varier selon la
     version de l'API — à valider avec le Swagger disponible dans ton
@@ -111,6 +114,13 @@ def fetch_jo_texts(token: str, target_date: str) -> list[dict]:
     payload = {"date": target_date}
 
     response = requests.post(url, headers=headers, json=payload, timeout=30)
+    if debug_log is not None:
+        debug_log.append({
+            "endpoint": "/consult/jorfCont",
+            "payload": payload,
+            "status": response.status_code,
+            "response": response.text[:3000],
+        })
     if response.status_code != 200:
         st.error(f"Erreur API Légifrance jorfCont ({response.status_code}) : {response.text[:300]}")
         return []
@@ -146,7 +156,7 @@ def fetch_jo_texts(token: str, target_date: str) -> list[dict]:
     return textes
 
 
-def search_jo_by_keyword(token: str, keyword: str, target_date: str, nb_results: int = 20) -> list[dict]:
+def search_jo_by_keyword(token: str, keyword: str, target_date: str, nb_results: int = 20, debug_log: list | None = None) -> list[dict]:
     """
     Recherche des textes JORF contenant un mot-clé précis, à une date donnée.
     Utilise l'endpoint de recherche générale de Légifrance (/search),
@@ -180,6 +190,14 @@ def search_jo_by_keyword(token: str, keyword: str, target_date: str, nb_results:
     }
 
     response = requests.post(url, headers=headers, json=payload, timeout=30)
+    if debug_log is not None:
+        debug_log.append({
+            "endpoint": "/search",
+            "keyword": keyword,
+            "payload": payload,
+            "status": response.status_code,
+            "response": response.text[:3000],
+        })
     if response.status_code != 200:
         st.warning(f"Recherche par mot-clé indisponible ({response.status_code}). Filtrage local utilisé à la place.")
         return []
@@ -308,6 +326,7 @@ def main():
         )
         only_environnement = st.checkbox("N'afficher que les textes liés à l'environnement", value=True)
         cee_focus = st.checkbox("Focus spécifique CEE dans les résumés", value=True)
+        debug_mode = st.checkbox("🔧 Mode debug (afficher les réponses API brutes)", value=False)
         run = st.button("🔍 Lancer la récupération", type="primary", use_container_width=True)
 
     if not run:
@@ -343,6 +362,7 @@ def main():
     textes = []
     seen_ids_global = set()
     dates_a_traiter = [start_date + timedelta(days=i) for i in range(nb_days)]
+    api_debug_log: list = []
 
     with st.spinner(f"Récupération des textes du {start_date.isoformat()} au {end_date.isoformat()}..."):
         progress_fetch = st.progress(0.0)
@@ -352,7 +372,7 @@ def main():
             if mode.startswith("Recherche ciblée"):
                 jour_textes = []
                 for kw in KEYWORDS_ENVIRONNEMENT:
-                    results = search_jo_by_keyword(token, kw, current_date_str)
+                    results = search_jo_by_keyword(token, kw, current_date_str, debug_log=api_debug_log if debug_mode else None)
                     for r in results:
                         rid = r.get("id") or r.get("titre")
                         if rid not in seen_ids_global:
@@ -362,7 +382,7 @@ def main():
                 # Si la recherche par mot-clé ne renvoie rien pour ce jour
                 # (endpoint à ajuster), on retombe sur récupération + filtre local.
                 if not jour_textes:
-                    day_all = fetch_jo_texts(token, current_date_str)
+                    day_all = fetch_jo_texts(token, current_date_str, debug_log=api_debug_log if debug_mode else None)
                     if only_environnement:
                         day_all = [t for t in day_all if matches_environnement(t)]
                     for t in day_all:
@@ -370,7 +390,7 @@ def main():
                     jour_textes = day_all
                 textes.extend(jour_textes)
             else:
-                day_all = fetch_jo_texts(token, current_date_str)
+                day_all = fetch_jo_texts(token, current_date_str, debug_log=api_debug_log if debug_mode else None)
                 if only_environnement:
                     day_all = [t for t in day_all if matches_environnement(t)]
                 for t in day_all:
@@ -379,6 +399,14 @@ def main():
 
             progress_fetch.progress((day_idx + 1) / nb_days)
         progress_fetch.empty()
+
+    if debug_mode:
+        with st.expander(f"🔧 Debug — {len(api_debug_log)} appel(s) API", expanded=True):
+            for entry in api_debug_log:
+                st.markdown(f"**{entry['endpoint']}** — statut `{entry['status']}`" + (f" — mot-clé : `{entry['keyword']}`" if "keyword" in entry else ""))
+                st.json(entry["payload"])
+                st.code(entry["response"], language="json")
+                st.divider()
 
     if not textes:
         st.warning(
