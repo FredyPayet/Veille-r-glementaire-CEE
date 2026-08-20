@@ -262,7 +262,11 @@ def main():
     # --- Barre latérale : paramètres ---
     with st.sidebar:
         st.header("Paramètres")
-        target_date = st.date_input("Date du JO", value=date.today(), max_value=date.today())
+        date_range = st.date_input(
+            "Plage de dates du JO",
+            value=(date.today() - timedelta(days=1), date.today()),
+            max_value=date.today(),
+        )
         mode = st.radio(
             "Mode de récupération",
             ["Tous les textes du jour (filtrés ensuite)", "Recherche ciblée CEE / environnement"],
@@ -273,10 +277,26 @@ def main():
         run = st.button("🔍 Lancer la récupération", type="primary", use_container_width=True)
 
     if not run:
-        st.info("Choisis une date et une méthode de récupération dans la barre latérale, puis lance la recherche.")
+        st.info("Choisis une plage de dates et une méthode de récupération dans la barre latérale, puis lance la recherche.")
         return
 
-    target_date_str = target_date.isoformat()
+    # date_input renvoie un tuple (début, fin) en mode plage, ou une date
+    # seule si l'utilisateur n'a encore sélectionné qu'un seul jour.
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_date, end_date = date_range
+    else:
+        start_date = end_date = date_range if not isinstance(date_range, tuple) else date_range[0]
+
+    if start_date > end_date:
+        st.error("La date de début doit précéder la date de fin.")
+        st.stop()
+
+    nb_days = (end_date - start_date).days + 1
+    if nb_days > 31:
+        st.warning(
+            f"Plage de {nb_days} jours sélectionnée — ça peut représenter beaucoup "
+            "d'appels API et de temps de traitement. Envisage de réduire la période."
+        )
 
     with st.spinner("Authentification auprès de PISTE..."):
         try:
@@ -285,39 +305,56 @@ def main():
             st.error(f"Échec de l'authentification PISTE : {e}")
             st.stop()
 
-    # --- Récupération des textes ---
+    # --- Récupération des textes sur toute la plage ---
     textes = []
-    with st.spinner(f"Récupération des textes du {target_date_str}..."):
-        if mode.startswith("Recherche ciblée"):
-            seen_ids = set()
-            for kw in KEYWORDS_ENVIRONNEMENT:
-                results = search_jo_by_keyword(token, kw, target_date_str)
-                for r in results:
-                    rid = r.get("id") or r.get("titre")
-                    if rid not in seen_ids:
-                        seen_ids.add(rid)
-                        textes.append(r)
-            # Si la recherche par mot-clé ne renvoie rien (endpoint à ajuster),
-            # on retombe sur la récupération complète + filtrage local.
-            if not textes:
-                st.info("Recherche ciblée sans résultat exploitable, bascule sur récupération complète + filtre local.")
-                textes = fetch_jo_texts(token, target_date_str)
+    seen_ids_global = set()
+    dates_a_traiter = [start_date + timedelta(days=i) for i in range(nb_days)]
+
+    with st.spinner(f"Récupération des textes du {start_date.isoformat()} au {end_date.isoformat()}..."):
+        progress_fetch = st.progress(0.0)
+        for day_idx, current_date in enumerate(dates_a_traiter):
+            current_date_str = current_date.isoformat()
+
+            if mode.startswith("Recherche ciblée"):
+                jour_textes = []
+                for kw in KEYWORDS_ENVIRONNEMENT:
+                    results = search_jo_by_keyword(token, kw, current_date_str)
+                    for r in results:
+                        rid = r.get("id") or r.get("titre")
+                        if rid not in seen_ids_global:
+                            seen_ids_global.add(rid)
+                            r["_date"] = current_date_str
+                            jour_textes.append(r)
+                # Si la recherche par mot-clé ne renvoie rien pour ce jour
+                # (endpoint à ajuster), on retombe sur récupération + filtre local.
+                if not jour_textes:
+                    day_all = fetch_jo_texts(token, current_date_str)
+                    if only_environnement:
+                        day_all = [t for t in day_all if matches_environnement(t)]
+                    for t in day_all:
+                        t["_date"] = current_date_str
+                    jour_textes = day_all
+                textes.extend(jour_textes)
+            else:
+                day_all = fetch_jo_texts(token, current_date_str)
                 if only_environnement:
-                    textes = [t for t in textes if matches_environnement(t)]
-        else:
-            textes = fetch_jo_texts(token, target_date_str)
-            if only_environnement:
-                textes = [t for t in textes if matches_environnement(t)]
+                    day_all = [t for t in day_all if matches_environnement(t)]
+                for t in day_all:
+                    t["_date"] = current_date_str
+                textes.extend(day_all)
+
+            progress_fetch.progress((day_idx + 1) / nb_days)
+        progress_fetch.empty()
 
     if not textes:
         st.warning(
-            "Aucun texte trouvé pour cette date avec ces critères. "
-            "Essaie une autre date, ou vérifie l'endpoint API dans le code "
+            "Aucun texte trouvé sur cette plage avec ces critères. "
+            "Essaie une autre période, ou vérifie l'endpoint API dans le code "
             "(la structure de réponse PISTE peut nécessiter un ajustement)."
         )
         return
 
-    st.success(f"{len(textes)} texte(s) trouvé(s).")
+    st.success(f"{len(textes)} texte(s) trouvé(s) sur {nb_days} jour(s).")
 
     # --- Résumé + affichage ---
     anthropic_client = Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"]) if has_anthropic_key else None
@@ -339,7 +376,13 @@ def main():
             # (contenu complet, ou résumé fourni par l'API, ou titre à défaut).
             resume = texte.get("contenu") or texte.get("resume") or "(Aucun contenu brut disponible dans la réponse API pour ce texte.)"
 
-        resultats.append({"titre": titre, "nature": texte.get("nature", ""), "cee": is_cee, "resume": resume})
+        resultats.append({
+            "date": texte.get("_date", ""),
+            "titre": titre,
+            "nature": texte.get("nature", ""),
+            "cee": is_cee,
+            "resume": resume,
+        })
         progress.progress((i + 1) / len(textes))
 
     progress.empty()
@@ -347,34 +390,40 @@ def main():
     # Tri : textes CEE en premier
     resultats.sort(key=lambda r: not r["cee"])
 
+    # Tri : date d'abord (plus récent en premier), puis textes CEE en tête
+    resultats.sort(key=lambda r: (r["date"], not r["cee"]), reverse=False)
+    resultats.sort(key=lambda r: not r["cee"])
+
     for r in resultats:
         badge = "🔋 CEE" if r["cee"] else "🌱 Environnement"
         label = "Résumé IA" if has_anthropic_key else "Contenu brut (pas de résumé IA)"
         with st.container(border=True):
-            st.markdown(f"**{badge}** · *{r['nature']}* · _{label}_")
+            st.markdown(f"**{badge}** · *{r['nature']}* · {r['date']} · _{label}_")
             st.subheader(r["titre"])
             st.markdown(r["resume"])
 
     # --- Export ---
     st.divider()
+    range_label = f"{start_date.isoformat()}_au_{end_date.isoformat()}" if start_date != end_date else start_date.isoformat()
     col1, col2 = st.columns(2)
     with col1:
         st.download_button(
             "📥 Télécharger en JSON",
             data=json.dumps(resultats, ensure_ascii=False, indent=2),
-            file_name=f"veille_jo_environnement_{target_date_str}.json",
+            file_name=f"veille_jo_environnement_{range_label}.json",
             mime="application/json",
             use_container_width=True,
         )
     with col2:
-        texte_export = f"VEILLE JO — ENVIRONNEMENT & CEE — {target_date_str}\n" + "=" * 50 + "\n\n"
+        periode_str = f"du {start_date.isoformat()} au {end_date.isoformat()}" if start_date != end_date else start_date.isoformat()
+        texte_export = f"VEILLE JO — ENVIRONNEMENT & CEE — {periode_str}\n" + "=" * 50 + "\n\n"
         for r in resultats:
             badge = "[CEE]" if r["cee"] else "[Environnement]"
-            texte_export += f"{badge} {r['titre']} ({r['nature']})\n\n{r['resume']}\n\n{'-'*50}\n\n"
+            texte_export += f"{badge} {r['titre']} ({r['nature']}) — {r['date']}\n\n{r['resume']}\n\n{'-'*50}\n\n"
         st.download_button(
             "📥 Télécharger en TXT",
             data=texte_export,
-            file_name=f"veille_jo_environnement_{target_date_str}.txt",
+            file_name=f"veille_jo_environnement_{range_label}.txt",
             mime="text/plain",
             use_container_width=True,
         )
