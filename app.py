@@ -91,11 +91,18 @@ def fetch_jo_texts(token: str, target_date: str) -> list[dict]:
     """
     Récupère les textes publiés au JO à une date donnée (fonds JORF).
 
-    NOTE : à ajuster selon la doc PISTE exacte (l'endpoint et les champs
-    de réponse peuvent varier — vérifier après un premier test réel sur
-    https://piste.gouv.fr).
+    D'après la doc officielle Légifrance/PISTE : /consult/jorf sert à
+    récupérer UN texte précis via son identifiant JORFTEXT — il ne prend
+    pas de date en entrée (c'est ce qui causait l'erreur 500 initiale).
+    Pour lister les textes d'un jour donné, il faut passer par
+    /consult/jorfCont, qui renvoie le "conteneur" du Journal Officiel de
+    ce jour avec la structure (sommaire) des textes qu'il contient.
+
+    NOTE : le nom exact des champs de payload/réponse peut varier selon la
+    version de l'API — à valider avec le Swagger disponible dans ton
+    espace PISTE (onglet "Explorer" / Swagger 2.0) si besoin d'ajuster.
     """
-    url = f"{LEGIFRANCE_BASE_URL}/consult/jorf"
+    url = f"{LEGIFRANCE_BASE_URL}/consult/jorfCont"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -105,11 +112,38 @@ def fetch_jo_texts(token: str, target_date: str) -> list[dict]:
 
     response = requests.post(url, headers=headers, json=payload, timeout=30)
     if response.status_code != 200:
-        st.error(f"Erreur API Légifrance ({response.status_code}) : {response.text[:300]}")
+        st.error(f"Erreur API Légifrance jorfCont ({response.status_code}) : {response.text[:300]}")
         return []
 
     data = response.json()
-    return data.get("textes", data.get("items", []))
+
+    # La réponse contient normalement une "structure" ou un "sommaire"
+    # listant chaque texte (id JORFTEXT, titre, nature...). Le nom exact
+    # du champ dépend de la version de l'API — on tente plusieurs clés.
+    structure = (
+        data.get("structure")
+        or data.get("sommaire")
+        or data.get("textes")
+        or data.get("items")
+        or []
+    )
+
+    # Les textes peuvent être imbriqués sous des sections selon la
+    # structure retournée. On aplatit tout en une liste simple.
+    textes: list[dict] = []
+
+    def _extract(node):
+        if isinstance(node, dict):
+            if "titre" in node or "id" in node:
+                textes.append(node)
+            for value in node.values():
+                _extract(value)
+        elif isinstance(node, list):
+            for item in node:
+                _extract(item)
+
+    _extract(structure)
+    return textes
 
 
 def search_jo_by_keyword(token: str, keyword: str, target_date: str, nb_results: int = 20) -> list[dict]:
@@ -135,7 +169,7 @@ def search_jo_by_keyword(token: str, keyword: str, target_date: str, nb_results:
                 }
             ],
             "filtres": [
-                {"facette": "DATE_SIGNATURE", "singleDate": target_date},
+                {"facette": "DATE_SIGNATURE", "dates": {"start": target_date, "end": target_date}},
             ],
             "pageSize": nb_results,
             "pageNumber": 1,
