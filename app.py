@@ -21,6 +21,7 @@ Lancement local :
 """
 
 import json
+import re
 from datetime import date, timedelta
 
 import requests
@@ -139,12 +140,16 @@ def fetch_jo_texts(token: str, target_date: str, debug_log: list | None = None) 
     )
 
     # Les textes peuvent être imbriqués sous des sections selon la
-    # structure retournée. On aplatit tout en une liste simple.
+    # structure retournée. On aplatit tout en une liste simple, en ne
+    # gardant que les nœuds qui ressemblent à un vrai texte JORF (avec un
+    # identifiant JORFTEXT), pour éviter d'attraper des en-têtes de section
+    # (ex : noms de ministères) qui n'ont qu'un "titre" sans contenu réel.
     textes: list[dict] = []
 
     def _extract(node):
         if isinstance(node, dict):
-            if "titre" in node or "id" in node:
+            node_id = node.get("id", "")
+            if "titre" in node and isinstance(node_id, str) and "JORFTEXT" in node_id:
                 textes.append(node)
             for value in node.values():
                 _extract(value)
@@ -203,7 +208,54 @@ def search_jo_by_keyword(token: str, keyword: str, target_date: str, nb_results:
         return []
 
     data = response.json()
-    return data.get("results", data.get("textes", []))
+    raw_results = data.get("results", data.get("textes", []))
+    return [normalize_legifrance_result(r) for r in raw_results]
+
+
+def normalize_legifrance_result(item: dict) -> dict:
+    """
+    Convertit un résultat brut de l'API Légifrance (endpoint /search) en un
+    format simple (titre, id, nature, contenu, date_publication) utilisé
+    partout ailleurs dans l'app.
+
+    Structure réelle observée pour un résultat /search :
+      {
+        "titles": [{"id": "...", "cid": "...", "title": "..."}],
+        "nature": "ARRETE",
+        "jorfText": "JORF n°... du ...",
+        "datePublication": "2026-08-12T00:00:00.000+0000",
+        "sections": [{"extracts": [{"values": ["texte avec <mark>mot</mark>..."]}]}],
+        ...
+      }
+    """
+    titles = item.get("titles") or [{}]
+    first_title = titles[0] if titles else {}
+    titre = first_title.get("title") or item.get("titre") or "Titre inconnu"
+    text_id = first_title.get("id") or first_title.get("cid") or item.get("id")
+
+    # Le contenu est réparti dans sections -> extracts -> values (extraits
+    # de texte, avec des balises <mark> autour des mots-clés recherchés).
+    contenu_parts = []
+    for section in item.get("sections") or []:
+        for extract in section.get("extracts") or []:
+            for value in extract.get("values") or []:
+                # Nettoyage des balises de surlignage <mark>...</mark>
+                cleaned = re.sub(r"</?mark>", "", value)
+                contenu_parts.append(cleaned)
+    contenu = "\n".join(contenu_parts) if contenu_parts else item.get("resumePrincipal", [""])[0] if item.get("resumePrincipal") else None
+
+    date_pub = item.get("datePublication")
+    date_str = date_pub[:10] if date_pub else None
+
+    return {
+        "titre": titre,
+        "id": text_id,
+        "nature": item.get("nature"),
+        "contenu": contenu,
+        "resume": None,
+        "date_api": date_str,
+        "_raw": item,
+    }
 
 
 def matches_environnement(texte: dict) -> bool:
