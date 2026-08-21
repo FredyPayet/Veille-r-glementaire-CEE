@@ -231,7 +231,10 @@ def normalize_legifrance_result(item: dict) -> dict:
     titles = item.get("titles") or [{}]
     first_title = titles[0] if titles else {}
     titre = first_title.get("title") or item.get("titre") or "Titre inconnu"
-    text_id = first_title.get("id") or first_title.get("cid") or item.get("id")
+    # Le champ "id" inclut un suffixe de version (ex: "JORFTEXT..._01-01-2999")
+    # qui fait échouer les appels ultérieurs. Le champ "cid" est l'identifiant
+    # stable du texte à utiliser pour les requêtes de type /consult/jorf.
+    text_id = first_title.get("cid") or first_title.get("id") or item.get("id")
 
     # Le contenu est réparti dans sections -> extracts -> values (extraits
     # de texte, avec des balises <mark> autour des mots-clés recherchés).
